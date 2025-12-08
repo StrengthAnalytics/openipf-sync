@@ -1,0 +1,48 @@
+name: OpenIPF Sync
+
+on:
+  # Run weekly on Sunday at 6:00 AM UTC
+  schedule:
+    - cron: '0 6 * * 0'
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      full_resync:
+        description: 'Perform full resync (clears all data first)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.full_resync }}" == "true" ]; then
+            echo "Running full resync..."
+            python sync.py --full
+          else
+            echo "Running incremental sync..."
+            python sync.py
+          fi
+
+      - name: Summary
+        run: echo "Sync completed successfully!" >> $GITHUB_STEP_SUMMARY
