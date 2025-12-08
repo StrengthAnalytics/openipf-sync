@@ -19,7 +19,7 @@ import requests
 from supabase import create_client, Client
 
 # Configuration
-OPENIPF_ZIP_URL = "https://openpowerlifting.gitlab.io/opl-csv/openipf-latest.zip"
+OPENIPF_ZIP_URL = "https://data.openpowerlifting.org/openipf-latest.zip"
 CSV_FILENAME = "openipf-latest.csv"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://gjkzotolfunbvfgfcljh.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
