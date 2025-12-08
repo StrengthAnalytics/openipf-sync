@@ -2,7 +2,7 @@
 
 Automatically syncs powerlifting data from [OpenIPF](https://www.openipf.org/) to a Supabase database.
 
-## Features
+## Features 
 
 - **Weekly automated sync** via GitHub Actions (runs every Sunday at 6:00 AM UTC)
 - **Incremental updates** - only syncs new records since the last sync
