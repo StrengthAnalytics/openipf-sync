@@ -8,6 +8,7 @@ Automatically syncs powerlifting data from [OpenIPF](https://www.openipf.org/) t
 - **Incremental updates** - only syncs new records since the last sync
 - **Full resync option** - manually trigger a complete data refresh
 - **Date filtering** - only includes records from January 1, 2022 onwards
+- **Automatic summary regeneration** - updates `lifter_summary` table after each sync
 
 ## Setup
 
@@ -22,9 +23,11 @@ Go to your repository's **Settings > Secrets and variables > Actions** and add:
 
 **Important:** Use the `service_role` key, not the `anon` key, as we need write access.
 
-### 2. Database Table
+### 2. Database Tables
 
-Ensure your Supabase database has a `lifter_records` table with the following schema:
+The sync expects two tables in your Supabase database:
+
+#### `lifter_records` (main data table)
 
 ```sql
 CREATE TABLE lifter_records (
@@ -75,6 +78,18 @@ CREATE TABLE lifter_records (
 );
 ```
 
+#### `lifter_summary` (aggregated per-lifter stats)
+
+This table is automatically regenerated after each sync with:
+- Best squat/bench/deadlift/total (with dates and meet names)
+- Total competition count
+- First and last competition dates
+- Weight classes and equipment types used
+
+### 3. (Optional) Install Database Function
+
+For faster summary regeneration, you can install the SQL function in `sql/regenerate_summary_function.sql`. Run it once in the Supabase SQL Editor. If not installed, the sync will fall back to Python-based regeneration.
+
 ## Usage
 
 ### Automatic Sync (Recommended)
@@ -105,6 +120,35 @@ python sync.py
 python sync.py --full
 ```
 
+## Backup Before Testing
+
+Before running the sync for the first time, it's recommended to backup your tables:
+
+### Option 1: Export to CSV (via Supabase Dashboard)
+1. Go to Table Editor
+2. Select your table
+3. Click Export > Export to CSV
+
+### Option 2: Create Backup Table (via SQL Editor)
+```sql
+-- Backup lifter_records
+CREATE TABLE lifter_records_backup AS SELECT * FROM lifter_records;
+
+-- Backup lifter_summary
+CREATE TABLE lifter_summary_backup AS SELECT * FROM lifter_summary;
+```
+
+### Restore from Backup
+```sql
+-- Restore lifter_records (if needed)
+DELETE FROM lifter_records;
+INSERT INTO lifter_records SELECT * FROM lifter_records_backup;
+
+-- Restore lifter_summary (if needed)
+DELETE FROM lifter_summary;
+INSERT INTO lifter_summary SELECT * FROM lifter_summary_backup;
+```
+
 ## Data Source
 
 Data is sourced from the [OpenPowerlifting](https://openpowerlifting.gitlab.io/opl-csv/bulk-csv.html) project, specifically the `openipf-latest.zip` file which contains IPF-affiliated federation data.
@@ -116,7 +160,8 @@ Data is sourced from the [OpenPowerlifting](https://openpowerlifting.gitlab.io/o
 3. Filters records to only include dates >= 2022-01-01
 4. Queries the database for the latest date already stored
 5. Inserts only records with dates newer than what's in the database
-6. Uses batch inserts (1000 records per batch) for efficiency
+6. Regenerates the `lifter_summary` table with updated aggregations
+7. Uses batch inserts (1000 records per batch) for efficiency
 
 ## License
 

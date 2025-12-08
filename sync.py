@@ -25,6 +25,7 @@ CSV_FILENAME = "openipf-latest.csv"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://gjkzotolfunbvfgfcljh.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 TABLE_NAME = "lifter_records"
+SUMMARY_TABLE_NAME = "lifter_summary"
 MIN_DATE = date(2022, 1, 1)
 BATCH_SIZE = 1000  # Number of records to insert per batch
 
@@ -211,6 +212,148 @@ def insert_records_batch(client: Client, records: list[dict]) -> int:
     return total_inserted
 
 
+def regenerate_lifter_summary(client: Client) -> int:
+    """
+    Regenerate the lifter_summary table by calling the database function.
+    Falls back to Python-based regeneration if the function doesn't exist.
+    """
+    logger.info("Regenerating lifter_summary table...")
+
+    try:
+        # Try calling the database function (most efficient)
+        client.rpc("regenerate_lifter_summary").execute()
+        logger.info("lifter_summary regenerated via database function")
+
+        # Get count of summaries
+        result = client.table(SUMMARY_TABLE_NAME).select("id", count="exact").execute()
+        count = result.count if result.count else 0
+        logger.info(f"lifter_summary now contains {count} lifter summaries")
+        return count
+
+    except Exception as e:
+        logger.warning(f"Database function not available ({e}), using Python fallback...")
+        return regenerate_lifter_summary_python(client)
+
+
+def regenerate_lifter_summary_python(client: Client) -> int:
+    """
+    Regenerate lifter_summary using Python/pandas.
+    This is a fallback if the database function isn't set up.
+    """
+    logger.info("Fetching all records for summary calculation...")
+
+    # Fetch all records (paginated)
+    all_records = []
+    page_size = 10000
+    offset = 0
+
+    while True:
+        result = client.table(TABLE_NAME).select("*").range(offset, offset + page_size - 1).execute()
+        if not result.data:
+            break
+        all_records.extend(result.data)
+        offset += page_size
+        logger.info(f"Fetched {len(all_records)} records...")
+        if len(result.data) < page_size:
+            break
+
+    if not all_records:
+        logger.warning("No records found in lifter_records")
+        return 0
+
+    logger.info(f"Processing {len(all_records)} records...")
+    df = pd.DataFrame(all_records)
+
+    # Convert date strings to dates for comparison
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+
+    # Group by lifter name and calculate summaries
+    summaries = []
+
+    for name, group in df.groupby("name"):
+        # Get the first record for basic info (sex, country)
+        first_record = group.iloc[0]
+
+        summary = {
+            "name": name,
+            "sex": first_record.get("sex"),
+            "country": first_record.get("country"),
+            "total_competitions": len(group),
+            "first_competition_date": group["date"].min().isoformat() if pd.notna(group["date"].min()) else None,
+            "last_competition_date": group["date"].max().isoformat() if pd.notna(group["date"].max()) else None,
+        }
+
+        # Best squat
+        squat_records = group[group["best3_squat_kg"].notna() & (group["best3_squat_kg"] > 0)]
+        if not squat_records.empty:
+            best_squat_idx = squat_records["best3_squat_kg"].idxmax()
+            best_squat_row = group.loc[best_squat_idx]
+            summary["best_squat_kg"] = float(best_squat_row["best3_squat_kg"])
+            summary["best_squat_date"] = best_squat_row["date"].isoformat() if pd.notna(best_squat_row["date"]) else None
+            summary["best_squat_meet"] = best_squat_row.get("meet_name")
+
+        # Best bench
+        bench_records = group[group["best3_bench_kg"].notna() & (group["best3_bench_kg"] > 0)]
+        if not bench_records.empty:
+            best_bench_idx = bench_records["best3_bench_kg"].idxmax()
+            best_bench_row = group.loc[best_bench_idx]
+            summary["best_bench_kg"] = float(best_bench_row["best3_bench_kg"])
+            summary["best_bench_date"] = best_bench_row["date"].isoformat() if pd.notna(best_bench_row["date"]) else None
+            summary["best_bench_meet"] = best_bench_row.get("meet_name")
+
+        # Best deadlift
+        deadlift_records = group[group["best3_deadlift_kg"].notna() & (group["best3_deadlift_kg"] > 0)]
+        if not deadlift_records.empty:
+            best_dl_idx = deadlift_records["best3_deadlift_kg"].idxmax()
+            best_dl_row = group.loc[best_dl_idx]
+            summary["best_deadlift_kg"] = float(best_dl_row["best3_deadlift_kg"])
+            summary["best_deadlift_date"] = best_dl_row["date"].isoformat() if pd.notna(best_dl_row["date"]) else None
+            summary["best_deadlift_meet"] = best_dl_row.get("meet_name")
+
+        # Best total
+        total_records = group[group["total_kg"].notna() & (group["total_kg"] > 0)]
+        if not total_records.empty:
+            best_total_idx = total_records["total_kg"].idxmax()
+            best_total_row = group.loc[best_total_idx]
+            summary["best_total_kg"] = float(best_total_row["total_kg"])
+            summary["best_total_date"] = best_total_row["date"].isoformat() if pd.notna(best_total_row["date"]) else None
+            summary["best_total_meet"] = best_total_row.get("meet_name")
+
+        # Weight classes (unique, as JSON array)
+        weight_classes = group["weight_class_kg"].dropna().unique().tolist()
+        summary["weight_classes"] = weight_classes if weight_classes else None
+
+        # Equipment types (unique, as JSON array)
+        equipment_types = group["equipment"].dropna().unique().tolist()
+        summary["equipment_types"] = equipment_types if equipment_types else None
+
+        # Timestamps
+        summary["updated_at"] = datetime.utcnow().isoformat()
+
+        summaries.append(summary)
+
+    logger.info(f"Calculated {len(summaries)} lifter summaries")
+
+    # Clear existing summaries
+    logger.info("Clearing existing lifter_summary records...")
+    client.table(SUMMARY_TABLE_NAME).delete().neq("id", 0).execute()
+
+    # Insert new summaries in batches
+    logger.info("Inserting new summaries...")
+    total_inserted = 0
+    for i in range(0, len(summaries), BATCH_SIZE):
+        batch = summaries[i:i + BATCH_SIZE]
+        try:
+            client.table(SUMMARY_TABLE_NAME).insert(batch).execute()
+            total_inserted += len(batch)
+            logger.info(f"Inserted summary batch {i // BATCH_SIZE + 1}: {len(batch)} summaries")
+        except Exception as e:
+            logger.error(f"Error inserting summary batch: {e}")
+
+    logger.info(f"lifter_summary regenerated with {total_inserted} summaries")
+    return total_inserted
+
+
 def sync():
     """Main sync function."""
     logger.info("Starting OpenIPF to Supabase sync")
@@ -243,6 +386,10 @@ def sync():
     records = prepare_records_for_insert(df)
     inserted_count = insert_records_batch(client, records)
 
+    # Regenerate lifter summary table
+    if inserted_count > 0:
+        regenerate_lifter_summary(client)
+
     logger.info(f"Sync complete! Inserted {inserted_count} new records")
     return inserted_count
 
@@ -270,6 +417,9 @@ def full_resync():
     # Prepare and insert records
     records = prepare_records_for_insert(df)
     inserted_count = insert_records_batch(client, records)
+
+    # Regenerate lifter summary table
+    regenerate_lifter_summary(client)
 
     logger.info(f"Full resync complete! Inserted {inserted_count} records")
     return inserted_count
