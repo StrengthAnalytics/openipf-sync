@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenIPF to Supabase Sync Script
+OpenIPF to Supabase Sync Script.
 
 Downloads the latest OpenIPF data and syncs new records to Supabase.
 Only processes records from 2022-01-01 onwards.
