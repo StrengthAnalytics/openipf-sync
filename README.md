@@ -1,33 +1,46 @@
 # OpenIPF to Supabase Sync
 
-Automatically syncs powerlifting data from [OpenIPF](https://www.openipf.org/) to a Supabase database.
+Automatically syncs powerlifting data from [OpenIPF](https://www.openipf.org/) (via the [OpenPowerlifting](https://openpowerlifting.gitlab.io/opl-csv/bulk-csv.html) `openipf-latest.zip` dump) to a Supabase database.
 
-## Features 
+Consumed by the Strength Hub application.
 
-- **Weekly automated sync** via GitHub Actions (runs every Sunday at 6:00 AM UTC)
-- **Incremental updates** - only syncs new records since the last sync
-- **Full resync option** - manually trigger a complete data refresh
-- **Date filtering** - only includes records from January 1, 2022 onwards
-- **Automatic summary regeneration** - updates `lifter_summary` table after each sync
+## Features
+
+- **Weekly automated sync** via GitHub Actions (runs every Sunday at 06:00 UTC).
+- **Idempotent upsert** on a natural-key unique index — safe to re-run, safe to run concurrently, safe to bulk-reload.
+- **Rolling-window incremental mode** (180 days) so late-published meets are picked up rather than silently dropped.
+- **Full resync** option for one-off backfills.
+- **Date filtering** — only includes records from 2022-01-01 onwards.
+- **Automatic summary rebuild** — calls `public.refresh_lifter_summary()` after each run so `lifter_summary` is always fresh.
+- **Run metadata** — writes each run's outcome (rows upserted, duration, status, last error) to `ingestion_metadata` so the app and ops can see sync health.
+
+## Prerequisites
+
+This sync depends on schema objects defined in the [Strength Hub](https://github.com/StrengthAnalytics/Strength-Hub) repository:
+
+| Object | Migration | Purpose |
+|--------|-----------|---------|
+| `lifter_records` table | (bulk-loaded; schema in this README below) | Target table |
+| `lifter_records_natural_key_unique` index | `096_lifter_records_dedup_and_unique.sql` | Enables `ON CONFLICT` upsert; prevents duplicates |
+| `ingestion_metadata` table | `096_lifter_records_dedup_and_unique.sql` | Run outcome log |
+| `public.refresh_lifter_summary()` | `097_refresh_lifter_summary_function.sql` | Rebuilds `lifter_summary` aggregate |
+
+Migrations 096 and 097 **must** be applied before running this sync.
 
 ## Setup
 
 ### 1. Configure GitHub Secrets
 
-Go to your repository's **Settings > Secrets and variables > Actions** and add:
+Go to **Settings → Secrets and variables → Actions** and add:
 
-| Secret Name | Description |
-|-------------|-------------|
-| `SUPABASE_URL` | Your Supabase project URL (e.g., `https://xxxxx.supabase.co`) |
-| `SUPABASE_SERVICE_KEY` | Your Supabase service role key (found in Settings > API) |
+| Secret | Description |
+|--------|-------------|
+| `SUPABASE_URL` | Project URL (e.g. `https://xxxxx.supabase.co`) |
+| `SUPABASE_SERVICE_KEY` | `service_role` key (Settings → API). Needed for write access. |
 
-**Important:** Use the `service_role` key, not the `anon` key, as we need write access.
+### 2. Database tables
 
-### 2. Database Tables
-
-The sync expects two tables in your Supabase database:
-
-#### `lifter_records` (main data table)
+The sync expects `lifter_records` with the schema:
 
 ```sql
 CREATE TABLE lifter_records (
@@ -42,127 +55,86 @@ CREATE TABLE lifter_records (
     division TEXT,
     bodyweight_kg NUMERIC,
     weight_class_kg TEXT,
-    squat1_kg NUMERIC,
-    squat2_kg NUMERIC,
-    squat3_kg NUMERIC,
-    squat4_kg NUMERIC,
-    best3_squat_kg NUMERIC,
-    bench1_kg NUMERIC,
-    bench2_kg NUMERIC,
-    bench3_kg NUMERIC,
-    bench4_kg NUMERIC,
-    best3_bench_kg NUMERIC,
-    deadlift1_kg NUMERIC,
-    deadlift2_kg NUMERIC,
-    deadlift3_kg NUMERIC,
-    deadlift4_kg NUMERIC,
-    best3_deadlift_kg NUMERIC,
+    squat1_kg NUMERIC, squat2_kg NUMERIC, squat3_kg NUMERIC, squat4_kg NUMERIC, best3_squat_kg NUMERIC,
+    bench1_kg NUMERIC, bench2_kg NUMERIC, bench3_kg NUMERIC, bench4_kg NUMERIC, best3_bench_kg NUMERIC,
+    deadlift1_kg NUMERIC, deadlift2_kg NUMERIC, deadlift3_kg NUMERIC, deadlift4_kg NUMERIC, best3_deadlift_kg NUMERIC,
     total_kg NUMERIC,
     place TEXT,
-    dots NUMERIC,
-    wilks NUMERIC,
-    glossbrenner NUMERIC,
-    goodlift NUMERIC,
+    dots NUMERIC, wilks NUMERIC, glossbrenner NUMERIC, goodlift NUMERIC,
     tested BOOLEAN,
-    country TEXT,
-    state TEXT,
-    federation TEXT,
-    parent_federation TEXT,
+    country TEXT, state TEXT,
+    federation TEXT, parent_federation TEXT,
     date DATE NOT NULL,
-    meet_country TEXT,
-    meet_state TEXT,
-    meet_name TEXT,
+    meet_country TEXT, meet_state TEXT, meet_name TEXT,
     sanctioned BOOLEAN,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 ```
 
-#### `lifter_summary` (aggregated per-lifter stats)
+Plus the unique index, `ingestion_metadata` table, and `refresh_lifter_summary()` function — all created by the migrations in the Strength Hub repo.
 
-This table is automatically regenerated after each sync with:
-- Best squat/bench/deadlift/total (with dates and meet names)
-- Total competition count
-- First and last competition dates
-- Weight classes and equipment types used
+## How it works
 
-### 3. (Optional) Install Database Function
+1. Downloads the latest `openipf-latest.zip` from OpenPowerlifting.
+2. Extracts and parses the CSV file.
+3. Filters records to dates >= 2022-01-01.
+4. Further filters to the rolling 180-day window (incremental) or keeps everything (full).
+5. Upserts records on the natural key `(name, date, meet_name, federation, event, equipment, division, weight_class_kg)` in batches of 1,000.
+   - Existing rows get updated with the latest result values — this is how OpenPowerlifting corrections (retroactive DQs, reviewed lifts, place changes) flow through.
+   - New rows get inserted.
+   - The `NULLS NOT DISTINCT` unique index ensures rows with NULL division / weight_class don't bypass the constraint.
+6. Calls `public.refresh_lifter_summary()` so `lifter_summary` reflects the new/updated records.
+7. Writes the run outcome to `ingestion_metadata` with `table_name = 'lifter_records'`.
 
-For faster summary regeneration, you can install the SQL function in `sql/regenerate_summary_function.sql`. Run it once in the Supabase SQL Editor. If not installed, the sync will fall back to Python-based regeneration.
+## Incremental vs full
+
+| Mode | When to use | What it upserts |
+|------|-------------|-----------------|
+| Incremental (default) | Weekly scheduled runs | Last 180 days of records |
+| `--full` | One-off backfill, schema changes, correcting historic gaps | All records since `MIN_DATE` (2022-01-01) |
+
+Both modes are safe to run repeatedly — the unique index guarantees no duplicates.
+
+## Why a rolling window instead of "date > latest_in_db"?
+
+Previously the sync skipped any row with `date <= latest_in_db`. But OpenPowerlifting does not publish results in strict date order — a meet held on 2026-01-25 might be published weeks later, by which time `latest_in_db` is already in February, causing the January meet to be silently dropped forever. The rolling 180-day window upserts everything recent on every run, so late publications are always picked up.
 
 ## Usage
 
-### Automatic Sync (Recommended)
+### Scheduled run
+The GitHub Action fires every Sunday at 06:00 UTC. No action required once secrets are configured.
 
-The GitHub Action runs automatically every Sunday at 6:00 AM UTC. No action required once secrets are configured.
+### Manual trigger
+1. Actions → OpenIPF Sync → Run workflow.
+2. Choose full resync or incremental.
 
-### Manual Sync
-
-1. Go to **Actions** tab in your repository
-2. Select **OpenIPF Sync** workflow
-3. Click **Run workflow**
-4. Choose whether to do a full resync or incremental sync
-
-### Local Development
-
+### Local development
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 
-# Set environment variables
 export SUPABASE_URL="https://your-project.supabase.co"
 export SUPABASE_SERVICE_KEY="your-service-role-key"
 
-# Run incremental sync
-python sync.py
-
-# Run full resync (clears all data first)
-python sync.py --full
+python sync.py          # incremental (180-day window)
+python sync.py --full   # full, all records since 2022-01-01
 ```
 
-## Backup Before Testing
+## Monitoring sync health
 
-Before running the sync for the first time, it's recommended to backup your tables:
+Query the `ingestion_metadata` table:
 
-### Option 1: Export to CSV (via Supabase Dashboard)
-1. Go to Table Editor
-2. Select your table
-3. Click Export > Export to CSV
-
-### Option 2: Create Backup Table (via SQL Editor)
 ```sql
--- Backup lifter_records
-CREATE TABLE lifter_records_backup AS SELECT * FROM lifter_records;
-
--- Backup lifter_summary
-CREATE TABLE lifter_summary_backup AS SELECT * FROM lifter_summary;
+SELECT * FROM ingestion_metadata WHERE table_name = 'lifter_records';
 ```
 
-### Restore from Backup
-```sql
--- Restore lifter_records (if needed)
-DELETE FROM lifter_records;
-INSERT INTO lifter_records SELECT * FROM lifter_records_backup;
+Look for:
+- `last_ingested_at` — how fresh is the data
+- `last_run_status` — `success` / `failure`
+- `last_error` — set on failure
+- `rows_inserted` — rows touched in the most recent run
+- `notes` — includes duration
 
--- Restore lifter_summary (if needed)
-DELETE FROM lifter_summary;
-INSERT INTO lifter_summary SELECT * FROM lifter_summary_backup;
-```
+## Data source
 
-## Data Source
-
-Data is sourced from the [OpenPowerlifting](https://openpowerlifting.gitlab.io/opl-csv/bulk-csv.html) project, specifically the `openipf-latest.zip` file which contains IPF-affiliated federation data.
-
-## How It Works
-
-1. Downloads the latest `openipf-latest.zip` from OpenPowerlifting
-2. Extracts and parses the CSV file
-3. Filters records to only include dates >= 2022-01-01
-4. Queries the database for the latest date already stored
-5. Inserts only records with dates newer than what's in the database
-6. Regenerates the `lifter_summary` table with updated aggregations
-7. Uses batch inserts (1000 records per batch) for efficiency
-
-## License
-
-This project uses data from OpenPowerlifting, which is contributed to the Public Domain.
+Data is sourced from the [OpenPowerlifting project](https://openpowerlifting.gitlab.io/opl-csv/bulk-csv.html), specifically the `openipf-latest.zip` which contains IPF-affiliated federation data. OpenPowerlifting data is contributed to the Public Domain.
